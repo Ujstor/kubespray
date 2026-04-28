@@ -1,0 +1,144 @@
+---
+# Pre-stage kubelet TLS-bootstrap kubeconfig and admin.conf on a non-first
+# control-plane host that hasn't joined yet.
+#
+# Why this is needed:
+#
+# 1. kubelet.env hard-codes `--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf`
+#    for every node (kubelet.env.v1beta1.j2). kubespray's `Enable kubelet`
+#    runs in roles/kubernetes/node, before kubeadm join in
+#    roles/kubernetes/control-plane. On a fresh CP neither
+#    /etc/kubernetes/kubelet.conf nor /etc/kubernetes/bootstrap-kubelet.conf
+#    exists at that point.
+#
+# 2. kubeadm 1.34's `join --control-plane` does NOT write
+#    bootstrap-kubelet.conf (only the worker-join code path does). It calls
+#    tryStartKubelet() and polls :10248/healthz for 4 min. kubelet exits 1 in
+#    a Restart=always loop with:
+#      "unable to load bootstrap kubeconfig: stat /etc/kubernetes/bootstrap-kubelet.conf:
+#       no such file or directory"
+#    kubeadm exits at kubelet-wait-bootstrap.
+#
+# 3. kube-vip's static-pod manifest hostPath-mounts /etc/kubernetes/admin.conf
+#    without `type:`. If admin.conf is missing when kubelet picks up the
+#    manifest, kubelet creates the path as a directory. kubeadm's kubeconfig
+#    subphase then fails with "is a directory".
+#
+# Fix: before kubelet starts on a non-first CP, slurp admin.conf and ca.crt
+# from the first CP and write a fresh bootstrap-kubelet.conf with a 1h token.
+# kubelet TLS-bootstraps on its first start, writes /etc/kubernetes/kubelet.conf
+# itself, registers the Node, becomes healthy. kube-vip's hostPath mount
+# finds a real file.
+#
+# No-op on:
+#   - the first CP (no peer to slurp from; kubeadm init writes its own files)
+#   - non-CP hosts (workers; kubeadm worker-join writes bootstrap-kubelet.conf)
+#   - hosts that already have kubelet.conf (already joined; rerun)
+
+- name: Bootstrap kubelet | stat existing kubeconfigs
+  stat:
+    path: "{{ item.path }}"
+  loop:
+    - { var: '_kubelet_conf_stat',  path: "{{ kube_config_dir }}/kubelet.conf" }
+    - { var: '_admin_conf_stat',    path: "{{ kube_config_dir }}/admin.conf" }
+  register: _bootstrap_kubelet_stats
+  when:
+    - "'kube_control_plane' in group_names"
+    - inventory_hostname != first_kube_control_plane
+
+- name: Bootstrap kubelet | flatten stat results
+  set_fact:
+    _bk_kubelet_conf_exists: "{{ _bootstrap_kubelet_stats.results[0].stat.exists | default(false) }}"
+    _bk_admin_conf_isdir: "{{ _bootstrap_kubelet_stats.results[1].stat.isdir | default(false) }}"
+    _bk_admin_conf_exists: "{{ _bootstrap_kubelet_stats.results[1].stat.exists | default(false) }}"
+  when:
+    - "'kube_control_plane' in group_names"
+    - inventory_hostname != first_kube_control_plane
+
+# kube-vip's hostPath-without-type can have created admin.conf as a dir on a
+# previous failed attempt. Remove so the slurp below writes a real file.
+- name: Bootstrap kubelet | remove admin.conf if it's a directory
+  file:
+    path: "{{ kube_config_dir }}/admin.conf"
+    state: absent
+  when:
+    - "'kube_control_plane' in group_names"
+    - inventory_hostname != first_kube_control_plane
+    - _bk_admin_conf_exists | default(false)
+    - _bk_admin_conf_isdir | default(false)
+
+- name: Bootstrap kubelet | pre-stage on fresh CP join
+  when:
+    - "'kube_control_plane' in group_names"
+    - inventory_hostname != first_kube_control_plane
+    - not (_bk_kubelet_conf_exists | default(false))
+  block:
+    - name: Bootstrap kubelet | generate token on first CP
+      command: >-
+        {{ bin_dir }}/kubeadm token create
+        --ttl 1h
+        --description "kubespray CP-join pre-stage for {{ inventory_hostname }}"
+      delegate_to: "{{ first_kube_control_plane }}"
+      register: _bk_token
+      changed_when: true
+
+    - name: Bootstrap kubelet | slurp ca.crt from first CP
+      slurp:
+        src: "{{ kube_cert_dir }}/ca.crt"
+      delegate_to: "{{ first_kube_control_plane }}"
+      register: _bk_ca
+
+    - name: Bootstrap kubelet | slurp admin.conf from first CP
+      slurp:
+        src: "{{ kube_config_dir }}/admin.conf"
+      delegate_to: "{{ first_kube_control_plane }}"
+      register: _bk_admin
+
+    - name: Bootstrap kubelet | ensure cert dir
+      file:
+        path: "{{ kube_cert_dir }}"
+        state: directory
+        mode: "0755"
+        owner: root
+        group: root
+
+    - name: Bootstrap kubelet | write ca.crt
+      copy:
+        content: "{{ _bk_ca.content | b64decode }}"
+        dest: "{{ kube_cert_dir }}/ca.crt"
+        mode: "0644"
+        owner: root
+        group: root
+
+    - name: Bootstrap kubelet | write admin.conf
+      copy:
+        content: "{{ _bk_admin.content | b64decode }}"
+        dest: "{{ kube_config_dir }}/admin.conf"
+        mode: "0600"
+        owner: root
+        group: root
+
+    - name: Bootstrap kubelet | write bootstrap-kubelet.conf
+      copy:
+        dest: "{{ kube_config_dir }}/bootstrap-kubelet.conf"
+        mode: "0600"
+        owner: root
+        group: root
+        content: |
+          apiVersion: v1
+          kind: Config
+          clusters:
+          - cluster:
+              certificate-authority: {{ kube_cert_dir }}/ca.crt
+              server: https://{{ apiserver_loadbalancer_domain_name | default(first_kube_control_plane_address) }}:{{ loadbalancer_apiserver.port | default(kube_apiserver_port) }}
+            name: kubernetes
+          contexts:
+          - context:
+              cluster: kubernetes
+              user: tls-bootstrap-token-user
+            name: tls-bootstrap-token-user@kubernetes
+          current-context: tls-bootstrap-token-user@kubernetes
+          users:
+          - name: tls-bootstrap-token-user
+            user:
+              token: {{ _bk_token.stdout }}

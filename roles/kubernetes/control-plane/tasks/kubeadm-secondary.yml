@@ -83,12 +83,56 @@
     - inventory_hostname != first_kube_control_plane
     - not kubeadm_already_run.stat.exists
 
+- name: Detect kubelet has already TLS-bootstrapped (CP-join idempotency)
+  # If /etc/kubernetes/kubelet.conf exists at this point, kubelet has already
+  # bootstrapped against the cluster (typically via the bootstrap_kubelet_conf
+  # pre-stage in roles/kubernetes/node) and the Node is registered. kubeadm's
+  # kubelet-start phase would then refuse with "Node already exists", and
+  # preflight would fail on existing files/ports. Auto-extend skip-phases and
+  # ignore-preflight-errors to walk past those.
+  stat:
+    path: "{{ kube_config_dir }}/kubelet.conf"
+  register: _cp_join_kubelet_conf
+  when:
+    - inventory_hostname != first_kube_control_plane
+    - kubeadm_already_run is not defined or not kubeadm_already_run.stat.exists
+
+- name: Compute effective kubeadm join overrides for fresh CP join
+  set_fact:
+    _cp_join_skip_phases: >-
+      {{ kubeadm_join_phases_skip
+         + (['kubelet-start'] if (_cp_join_kubelet_conf.stat.exists | default(false))
+                                  and 'kubelet-start' not in kubeadm_join_phases_skip
+            else []) }}
+    _cp_join_ignore_preflight: >-
+      {{ kubeadm_ignore_preflight_errors
+         + ((_cp_join_extra_ignore_preflight | default([]))
+            if (_cp_join_kubelet_conf.stat.exists | default(false)) else []) }}
+  vars:
+    _cp_join_extra_ignore_preflight:
+      - FileAvailable--etc-kubernetes-manifests-kube-apiserver.yaml
+      - FileAvailable--etc-kubernetes-manifests-kube-controller-manager.yaml
+      - FileAvailable--etc-kubernetes-manifests-kube-scheduler.yaml
+      - FileAvailable--etc-kubernetes-manifests-etcd.yaml
+      - FileAvailable--etc-kubernetes-kubelet.conf
+      - FileAvailable--etc-kubernetes-bootstrap-kubelet.conf
+      - DirAvailable--var-lib-etcd
+      - Port-6443
+      - Port-10250
+      - Port-10257
+      - Port-10259
+      - Port-2379
+      - Port-2380
+  when:
+    - inventory_hostname != first_kube_control_plane
+    - kubeadm_already_run is not defined or not kubeadm_already_run.stat.exists
+
 - name: Joining control plane node to the cluster.
   command: >-
     {{ bin_dir }}/kubeadm join
     --config {{ kube_config_dir }}/kubeadm-controlplane.yaml
-    --ignore-preflight-errors={{ kubeadm_ignore_preflight_errors | join(',') }}
-    --skip-phases={{ kubeadm_join_phases_skip | join(',') }}
+    --ignore-preflight-errors={{ _cp_join_ignore_preflight | join(',') }}
+    --skip-phases={{ _cp_join_skip_phases | join(',') }}
   environment:
     PATH: "{{ bin_dir }}:{{ ansible_env.PATH }}"
   register: kubeadm_join_control_plane
@@ -98,6 +142,27 @@
   when:
     - inventory_hostname != first_kube_control_plane
     - kubeadm_already_run is not defined or not kubeadm_already_run.stat.exists
+
+# When we auto-skip kubelet-start (because kubelet had already bootstrapped),
+# kubeadm doesn't write /var/lib/kubelet/config.yaml. kubespray's
+# `kubeadm_already_run` heuristic stats only that file; without it, the next
+# pipeline run treats this CP as un-joined and fires `kubeadm reset`. Stamp
+# it from the freshly-rendered KubeletConfiguration so subsequent runs are
+# correct. Idempotent (force: false).
+- name: Stamp /var/lib/kubelet/config.yaml after CP join (kubelet-start skipped)
+  copy:
+    src: "{{ kube_config_dir }}/kubelet-config.yaml"
+    dest: /var/lib/kubelet/config.yaml
+    remote_src: true
+    mode: "0644"
+    owner: root
+    group: root
+    force: false
+  when:
+    - inventory_hostname != first_kube_control_plane
+    - _cp_join_kubelet_conf.stat.exists | default(false)
+    - 'kubelet-start' in (_cp_join_skip_phases | default([]))
+    - kubeadm_join_control_plane is succeeded
 
 - name: Wait for new control plane nodes to be Ready
   when: kubeadm_already_run.stat.exists

@@ -143,6 +143,18 @@
   tags:
     - kube-proxy
 
+- name: Pre-stage TLS-bootstrap kubeconfig for fresh CP joins
+  # Required because kubeadm 1.34's `join --control-plane` does not write
+  # /etc/kubernetes/bootstrap-kubelet.conf, but kubespray's kubelet.env pins
+  # --bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf for every
+  # node and starts kubelet before kubeadm join runs. Without pre-staging,
+  # kubelet crash-loops and kubeadm exits at kubelet-wait-bootstrap.
+  # No-op on first CP, workers, and already-joined CPs. See task file.
+  import_tasks: bootstrap_kubelet_conf.yml
+  tags:
+    - kubelet
+    - kubeadm
+
 - name: Install kubelet
   import_tasks: kubelet.yml
   tags:
